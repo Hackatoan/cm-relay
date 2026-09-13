@@ -1,5 +1,7 @@
 # Canvas Messenger — Relay Server
 
+> **🔗 Part of Canvas Messenger:** [canvas-messenger](https://github.com/Hackatoan/canvas-messenger) (extension) · [cm-relay](https://github.com/Hackatoan/cm-relay) (REST API) · [cm-signaling](https://github.com/Hackatoan/cm-signaling) (WebRTC signaling)
+
 The REST API + message relay backend for [Canvas Messenger](https://github.com/Hackatoan/canvas-messenger), a Discord-style messaging layer for Canvas LMS.
 
 ☕ **Support:** [Buy Me a Coffee](https://buymeacoffee.com/hackatoa)
