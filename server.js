@@ -109,7 +109,7 @@ app.post('/api/register', rateLimit('register'), (req, res) => {
 
 // Search by name or email
 app.get('/api/users/search', auth, (req, res) => {
-    const q = (req.query.q || '').toLowerCase().trim();
+    const q = String(req.query.q || '').toLowerCase().trim();
     if (q.length < 2) return res.json([]);
     const results = Object.values(db.users)
         .filter(u => u.id !== req.user.id &&
@@ -246,7 +246,10 @@ wss.on('connection', ws => {
     });
     ws.on('close', () => {
         if (userId) {
-            wsClients.delete(userId);
+            // Only remove the map entry if it still points at *this* socket — a user
+            // reconnecting (e.g. a second tab) overwrites the entry with the new
+            // socket, and the old socket's close event must not evict it.
+            if (wsClients.get(userId) === ws) wsClients.delete(userId);
             if (db.users[userId]) {
                 db.users[userId].lastSeen = new Date().toISOString();
                 scheduleSave();
