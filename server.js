@@ -6,6 +6,7 @@ const http = require('http');
 const fs = require('fs');
 const dns = require('dns').promises;
 const net = require('net');
+const https = require('https');
 
 const DB_PATH = '/data/relay.json';
 let db = { users: {}, messages: [], invites: {} };
@@ -127,6 +128,39 @@ function isPrivateIp(ip) {
     return true; // unrecognized format: don't trust it
 }
 const CANVAS_VERIFY_TIMEOUT_MS = 5_000;
+const CANVAS_VERIFY_MAX_BODY = 100_000;
+
+// Connects directly to the exact IP we already vetted with isPrivateIp,
+// instead of handing the hostname to a request library that would resolve
+// DNS again internally — a second, independent lookup is exactly the gap
+// DNS rebinding exploits (attacker's short-TTL domain answers differently
+// on each query). SNI/Host stay the original hostname so cert validation
+// and virtual-hosting still work normally.
+function fetchPinned(hostname, port, ip, path, token) {
+    return new Promise((resolve, reject) => {
+        const req = https.request({
+            host: ip,
+            port,
+            path,
+            servername: hostname,
+            headers: { Host: hostname, Authorization: `Bearer ${token}` },
+            timeout: CANVAS_VERIFY_TIMEOUT_MS,
+        }, (res) => {
+            let body = '';
+            let bytes = 0;
+            res.on('data', (chunk) => {
+                bytes += chunk.length;
+                if (bytes > CANVAS_VERIFY_MAX_BODY) { req.destroy(); return reject(new Error('response too large')); }
+                body += chunk;
+            });
+            res.on('end', () => resolve({ status: res.statusCode, body }));
+        });
+        req.on('timeout', () => req.destroy(new Error('timeout')));
+        req.on('error', reject);
+        req.end();
+    });
+}
+
 async function verifyCanvasIdentity(canvasUrl, canvasUserId, canvasToken) {
     if (!canvasToken || typeof canvasToken !== 'string') return false;
     let url;
@@ -136,21 +170,14 @@ async function verifyCanvasIdentity(canvasUrl, canvasUserId, canvasToken) {
     try { addr = await dns.lookup(url.hostname); } catch { return false; }
     if (isPrivateIp(addr.address)) return false; // SSRF guard: canvasUrl is client-supplied
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), CANVAS_VERIFY_TIMEOUT_MS);
     try {
-        const res = await fetch(`${url.origin}/api/v1/users/self`, {
-            headers: { Authorization: `Bearer ${canvasToken}` },
-            redirect: 'manual', // never follow a redirect to an attacker-chosen host
-            signal: controller.signal,
-        });
-        if (!res.ok) return false;
-        const body = await res.json();
-        return body && String(body.id) === String(canvasUserId);
+        const port = url.port ? Number(url.port) : 443;
+        const res = await fetchPinned(url.hostname, port, addr.address, '/api/v1/users/self', canvasToken);
+        if (res.status < 200 || res.status >= 300) return false; // covers redirects too: we never follow them
+        const parsed = JSON.parse(res.body);
+        return parsed && String(parsed.id) === String(canvasUserId);
     } catch {
-        return false; // fail closed: unreachable/erroring Canvas instance proves nothing
-    } finally {
-        clearTimeout(timer);
+        return false; // fail closed: unreachable/erroring/malformed proves nothing
     }
 }
 
