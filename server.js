@@ -40,7 +40,20 @@ const MAX_NAME_LEN = 100;
 const MAX_EMAIL_LEN = 200;
 const MAX_CRYPTO_FIELD_LEN = 100_000; // base64 ciphertext / iv safety cap
 
-// Simple in-memory per-IP sliding-window rate limiter for abuse-prone endpoints.
+// Simple in-memory sliding-window counter shared by the REST rate limiter
+// below and the WebSocket connect/message limiters further down.
+function withinLimit(bucketMap, key, windowMs, max) {
+    const now = Date.now();
+    let bucket = bucketMap.get(key);
+    if (!bucket || now > bucket.resetAt) {
+        bucket = { count: 0, resetAt: now + windowMs };
+        bucketMap.set(key, bucket);
+    }
+    bucket.count++;
+    return bucket.count <= max;
+}
+
+// Per-IP sliding-window rate limiter for abuse-prone REST endpoints.
 const RATE_LIMITS = {
     register: { windowMs: 60_000, max: 10 },
     messages: { windowMs: 60_000, max: 120 },
@@ -50,21 +63,23 @@ const rateBuckets = new Map();
 function rateLimit(name) {
     const { windowMs, max } = RATE_LIMITS[name];
     return (req, res, next) => {
-        const key = `${name}:${req.ip}`;
-        const now = Date.now();
-        let bucket = rateBuckets.get(key);
-        if (!bucket || now > bucket.resetAt) {
-            bucket = { count: 0, resetAt: now + windowMs };
-            rateBuckets.set(key, bucket);
+        if (!withinLimit(rateBuckets, `${name}:${req.ip}`, windowMs, max)) {
+            return res.status(429).json({ error: 'Too many requests — slow down' });
         }
-        bucket.count++;
-        if (bucket.count > max) return res.status(429).json({ error: 'Too many requests — slow down' });
         next();
     };
 }
+
+// WebSocket abuse limits: cap new connections per IP (connect flood) and
+// messages per connection (e.g. a spammed 'typing' flood aimed at a peer).
+const WS_CONNECT_LIMIT = { windowMs: 60_000, max: 30 };
+const WS_MESSAGE_LIMIT = { windowMs: 10_000, max: 60 };
+const wsConnectBuckets = new Map();
+
 setInterval(() => {
     const now = Date.now();
     for (const [k, v] of rateBuckets) if (now > v.resetAt) rateBuckets.delete(k);
+    for (const [k, v] of wsConnectBuckets) if (now > v.resetAt) wsConnectBuckets.delete(k);
 }, 5 * 60_000).unref();
 
 const app = express();
@@ -227,12 +242,23 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 const wsClients = new Map();
 
-wss.on('connection', ws => {
+wss.on('connection', (ws, req) => {
+    const ip = req.socket.remoteAddress || 'unknown';
+    if (!withinLimit(wsConnectBuckets, ip, WS_CONNECT_LIMIT.windowMs, WS_CONNECT_LIMIT.max)) {
+        ws.close(1013, 'Too many connections');
+        return;
+    }
+
     let userId = null;
+    let msgBucket = { count: 0, resetAt: Date.now() + WS_MESSAGE_LIMIT.windowMs };
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', data => {
+        const now = Date.now();
+        if (now > msgBucket.resetAt) msgBucket = { count: 0, resetAt: now + WS_MESSAGE_LIMIT.windowMs };
+        msgBucket.count++;
+        if (msgBucket.count > WS_MESSAGE_LIMIT.max) { ws.close(1013, 'Too many messages'); return; }
         try {
             const msg = JSON.parse(data);
             if (msg.type === 'auth') {
