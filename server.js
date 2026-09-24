@@ -131,6 +131,15 @@ app.post('/api/register', rateLimit('register'), (req, res) => {
     res.json({ id, authToken });
 });
 
+// Current authenticated user's own identity — used by other services (e.g.
+// cm-signaling) to verify a bearer token actually belongs to the Canvas user
+// it's being presented for, without those services needing their own copy
+// of user records.
+app.get('/api/me', auth, (req, res) => {
+    const u = req.user;
+    res.json({ id: u.id, name: u.name, email: u.email, canvasUserId: u.canvasUserId, canvasUrl: u.canvasUrl });
+});
+
 // Search by name or email
 app.get('/api/users/search', auth, (req, res) => {
     const q = String(req.query.q || '').toLowerCase().trim();
