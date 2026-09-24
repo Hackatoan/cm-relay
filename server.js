@@ -4,6 +4,8 @@ const { WebSocketServer } = require('ws');
 const crypto = require('crypto');
 const http = require('http');
 const fs = require('fs');
+const dns = require('dns').promises;
+const net = require('net');
 
 const DB_PATH = '/data/relay.json';
 let db = { users: {}, messages: [], invites: {} };
@@ -100,9 +102,61 @@ function auth(req, res, next) {
     next();
 }
 
+// SECURITY: canvasUserId (a small, often-sequential per-instance integer)
+// and canvasUrl (the school's public Canvas domain) are not secrets — before
+// this fix, anyone who knew/guessed both could POST them to /api/register
+// and walk away with an existing account's real authToken (full API access:
+// read/send messages, search, presence, invites) AND silently overwrite its
+// publicKey (breaking E2E confidentiality for every future message sent to
+// that user). Reusing an existing account now requires proving the caller
+// actually holds a live Canvas session for that exact canvasUserId, by
+// presenting a Canvas API token the relay verifies server-side against
+// canvasUrl's own /api/v1/users/self.
+const PRIVATE_IPV4_RANGES = [
+    [/^127\./], [/^10\./], [/^169\.254\./], [/^192\.168\./],
+    [/^172\.(1[6-9]|2\d|3[01])\./], [/^0\./], [/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./],
+];
+function isPrivateIp(ip) {
+    if (net.isIPv4(ip)) return PRIVATE_IPV4_RANGES.some(([re]) => re.test(ip));
+    if (net.isIPv6(ip)) {
+        const lower = ip.toLowerCase();
+        return lower === '::1' || lower.startsWith('fe80:') || lower.startsWith('fc') || lower.startsWith('fd')
+            || lower.startsWith('::ffff:127.') || lower.startsWith('::ffff:10.') || lower.startsWith('::ffff:169.254.')
+            || lower.startsWith('::ffff:192.168.');
+    }
+    return true; // unrecognized format: don't trust it
+}
+const CANVAS_VERIFY_TIMEOUT_MS = 5_000;
+async function verifyCanvasIdentity(canvasUrl, canvasUserId, canvasToken) {
+    if (!canvasToken || typeof canvasToken !== 'string') return false;
+    let url;
+    try { url = new URL(canvasUrl); } catch { return false; }
+    if (url.protocol !== 'https:') return false; // no plaintext token transport
+    let addr;
+    try { addr = await dns.lookup(url.hostname); } catch { return false; }
+    if (isPrivateIp(addr.address)) return false; // SSRF guard: canvasUrl is client-supplied
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CANVAS_VERIFY_TIMEOUT_MS);
+    try {
+        const res = await fetch(`${url.origin}/api/v1/users/self`, {
+            headers: { Authorization: `Bearer ${canvasToken}` },
+            redirect: 'manual', // never follow a redirect to an attacker-chosen host
+            signal: controller.signal,
+        });
+        if (!res.ok) return false;
+        const body = await res.json();
+        return body && String(body.id) === String(canvasUserId);
+    } catch {
+        return false; // fail closed: unreachable/erroring Canvas instance proves nothing
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 // Register / update profile
-app.post('/api/register', rateLimit('register'), (req, res) => {
-    let { name, email, publicKey, canvasUserId, canvasUrl } = req.body || {};
+app.post('/api/register', rateLimit('register'), async (req, res) => {
+    let { name, email, publicKey, canvasUserId, canvasUrl, canvasToken } = req.body || {};
     if (!name || !publicKey) return res.status(400).json({ error: 'name and publicKey required' });
     name = String(name).trim().slice(0, MAX_NAME_LEN);
     if (!name) return res.status(400).json({ error: 'name and publicKey required' });
@@ -113,9 +167,18 @@ app.post('/api/register', rateLimit('register'), (req, res) => {
         : null;
 
     if (existing) {
+        if (!(await verifyCanvasIdentity(canvasUrl, canvasUserId, canvasToken))) {
+            return res.status(401).json({ error: 'Could not verify Canvas identity for this account' });
+        }
+        // Rotate the token on every verified reclaim: anyone who obtained the
+        // old one (e.g. via this same endpoint before this fix existed) must
+        // not keep standing access just because the real owner re-registered.
+        usersByToken.delete(existing.authToken);
+        existing.authToken = crypto.randomBytes(32).toString('hex');
         existing.name = name;
         existing.email = email || null;
         existing.publicKey = publicKey;
+        usersByToken.set(existing.authToken, existing);
         saveDb();
         return res.json({ id: existing.id, authToken: existing.authToken });
     }
