@@ -8,6 +8,13 @@ const fs = require('fs');
 const DB_PATH = '/data/relay.json';
 let db = { users: {}, messages: [], invites: {} };
 try { db = JSON.parse(fs.readFileSync(DB_PATH, 'utf8')); } catch {}
+
+// authToken -> user index, kept in sync with db.users. auth() runs on nearly
+// every API request and the WS 'auth' handshake; without this it was doing a
+// linear Object.values(db.users).find(...) scan per request.
+const usersByToken = new Map();
+for (const u of Object.values(db.users)) usersByToken.set(u.authToken, u);
+
 function saveDb() {
     try {
         const tmp = DB_PATH + '.tmp';
@@ -72,7 +79,7 @@ app.use((req, res, next) => {
 
 function auth(req, res, next) {
     const token = (req.headers.authorization || '').replace('Bearer ', '');
-    const user = Object.values(db.users).find(u => u.authToken === token);
+    const user = usersByToken.get(token);
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
     req.user = user;
     next();
@@ -100,9 +107,11 @@ app.post('/api/register', rateLimit('register'), (req, res) => {
 
     const id = crypto.randomUUID();
     const authToken = crypto.randomBytes(32).toString('hex');
-    db.users[id] = { id, name, email: email || null, publicKey, authToken,
+    const user = { id, name, email: email || null, publicKey, authToken,
         canvasUserId: canvasUserId || null, canvasUrl: canvasUrl || null,
         createdAt: new Date().toISOString() };
+    db.users[id] = user;
+    usersByToken.set(authToken, user);
     saveDb();
     res.json({ id, authToken });
 });
@@ -227,7 +236,7 @@ wss.on('connection', ws => {
         try {
             const msg = JSON.parse(data);
             if (msg.type === 'auth') {
-                const user = Object.values(db.users).find(u => u.authToken === msg.token);
+                const user = usersByToken.get(msg.token);
                 if (user) {
                     userId = user.id;
                     wsClients.set(userId, ws);
