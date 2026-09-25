@@ -18,6 +18,16 @@ try { db = JSON.parse(fs.readFileSync(DB_PATH, 'utf8')); } catch {}
 const usersByToken = new Map();
 for (const u of Object.values(db.users)) usersByToken.set(u.authToken, u);
 
+// (canvasUrl, canvasUserId) -> user index, kept in sync with db.users. The
+// /api/register reclaim path below runs on every registration (i.e. every
+// extension install/reload, not just first sign-up) and was doing a linear
+// Object.values(db.users).find(...) scan to find the account being reclaimed.
+const usersByCanvasKey = new Map();
+function canvasKey(url, id) { return JSON.stringify([url, id]); }
+for (const u of Object.values(db.users)) {
+    if (u.canvasUserId && u.canvasUrl) usersByCanvasKey.set(canvasKey(u.canvasUrl, u.canvasUserId), u);
+}
+
 function saveDb() {
     try {
         const tmp = DB_PATH + '.tmp';
@@ -190,7 +200,7 @@ app.post('/api/register', rateLimit('register'), async (req, res) => {
     if (email) email = String(email).trim().slice(0, MAX_EMAIL_LEN);
 
     let existing = canvasUserId && canvasUrl
-        ? Object.values(db.users).find(u => u.canvasUserId === canvasUserId && u.canvasUrl === canvasUrl)
+        ? usersByCanvasKey.get(canvasKey(canvasUrl, canvasUserId))
         : null;
 
     if (existing) {
@@ -217,6 +227,7 @@ app.post('/api/register', rateLimit('register'), async (req, res) => {
         createdAt: new Date().toISOString() };
     db.users[id] = user;
     usersByToken.set(authToken, user);
+    if (canvasUserId && canvasUrl) usersByCanvasKey.set(canvasKey(canvasUrl, canvasUserId), user);
     saveDb();
     res.json({ id, authToken });
 });
