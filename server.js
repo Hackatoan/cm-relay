@@ -68,9 +68,15 @@ function withinLimit(bucketMap, key, windowMs, max) {
 
 // Per-IP sliding-window rate limiter for abuse-prone REST endpoints.
 const RATE_LIMITS = {
-    register: { windowMs: 60_000, max: 10 },
-    messages: { windowMs: 60_000, max: 120 },
-    invites:  { windowMs: 60_000, max: 20 },
+    register:        { windowMs: 60_000, max: 10 },
+    messages:        { windowMs: 60_000, max: 120 },
+    invites:         { windowMs: 60_000, max: 20 },
+    'invite-lookup': { windowMs: 60_000, max: 30 },  // unauthenticated — no other friction on this route
+    search:          { windowMs: 60_000, max: 60 },
+    lookup:          { windowMs: 60_000, max: 120 },
+    'messages-poll': { windowMs: 60_000, max: 300 },
+    'messages-read': { windowMs: 60_000, max: 60 },
+    presence:        { windowMs: 60_000, max: 60 },
 };
 const rateBuckets = new Map();
 function rateLimit(name) {
@@ -242,7 +248,7 @@ app.get('/api/me', auth, (req, res) => {
 });
 
 // Search by name or email
-app.get('/api/users/search', auth, (req, res) => {
+app.get('/api/users/search', auth, rateLimit('search'), (req, res) => {
     const q = String(req.query.q || '').toLowerCase().trim();
     if (q.length < 2) return res.json([]);
     const results = Object.values(db.users)
@@ -254,7 +260,7 @@ app.get('/api/users/search', auth, (req, res) => {
 });
 
 // Get user by ID
-app.get('/api/users/:id', auth, (req, res) => {
+app.get('/api/users/:id', auth, rateLimit('lookup'), (req, res) => {
     const u = db.users[req.params.id];
     if (!u) return res.status(404).json({ error: 'Not found' });
     res.json({ id: u.id, name: u.name, email: u.email, publicKey: u.publicKey });
@@ -286,7 +292,7 @@ app.post('/api/messages', auth, rateLimit('messages'), (req, res) => {
 });
 
 // Get messages since timestamp
-app.get('/api/messages', auth, (req, res) => {
+app.get('/api/messages', auth, rateLimit('messages-poll'), (req, res) => {
     const since = req.query.since || '1970-01-01T00:00:00.000Z';
     const msgs = db.messages
         .filter(m => (m.senderId === req.user.id || m.recipientId === req.user.id) && m.sentAt > since)
@@ -295,7 +301,7 @@ app.get('/api/messages', auth, (req, res) => {
 });
 
 // Mark all messages in a thread addressed to me as read, and notify the sender.
-app.post('/api/messages/read', auth, (req, res) => {
+app.post('/api/messages/read', auth, rateLimit('messages-read'), (req, res) => {
     const { threadId } = req.body || {};
     if (!threadId) return res.status(400).json({ error: 'threadId required' });
 
@@ -320,7 +326,7 @@ app.post('/api/messages/read', auth, (req, res) => {
 });
 
 // Online/last-seen status for a batch of user ids
-app.get('/api/presence', auth, (req, res) => {
+app.get('/api/presence', auth, rateLimit('presence'), (req, res) => {
     const ids = String(req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 50);
     const result = {};
     for (const id of ids) {
@@ -339,7 +345,7 @@ app.post('/api/invites', auth, rateLimit('invites'), (req, res) => {
 });
 
 // Resolve invite
-app.get('/api/invites/:token', (req, res) => {
+app.get('/api/invites/:token', rateLimit('invite-lookup'), (req, res) => {
     const inv = db.invites[req.params.token];
     if (!inv) return res.status(404).json({ error: 'Invalid invite' });
     const u = db.users[inv.creatorId];
