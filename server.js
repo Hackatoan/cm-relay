@@ -7,10 +7,32 @@ const fs = require('fs');
 const dns = require('dns').promises;
 const net = require('net');
 const https = require('https');
+const admin = require('firebase-admin');
 
 const DB_PATH = '/data/relay.json';
 let db = { users: {}, messages: [], invites: {} };
 try { db = JSON.parse(fs.readFileSync(DB_PATH, 'utf8')); } catch {}
+
+// Firestore is used only as cross-device escrow for each user's long-term
+// ECDH keypair (+ their contacts list) — everything else (accounts, messages)
+// stays in relay.json as before. Every access goes through this trusted
+// server using the service-account's admin privileges, so there are no
+// Firestore security rules to maintain and no Firebase Auth involved on the
+// client. If the credential is missing/invalid, sync is skipped (logged
+// once) rather than failing registration — an extension install must keep
+// working even if Firestore is temporarily unreachable or unconfigured.
+let fsdb = null;
+try {
+    const svcJson = process.env.FIREBASE_SERVICE_ACCOUNT;
+    if (svcJson) {
+        admin.initializeApp({ credential: admin.credential.cert(JSON.parse(svcJson)) });
+        fsdb = admin.firestore();
+    } else {
+        console.warn('[CM-Relay] FIREBASE_SERVICE_ACCOUNT not set — cross-device key sync disabled.');
+    }
+} catch (e) {
+    console.error('[CM-Relay] Firebase Admin init failed — cross-device key sync disabled:', e.message);
+}
 
 // authToken -> user index, kept in sync with db.users. auth() runs on nearly
 // every API request and the WS 'auth' handshake; without this it was doing a
@@ -197,9 +219,31 @@ async function verifyCanvasIdentity(canvasUrl, canvasUserId, canvasToken) {
     }
 }
 
+// Read this user's escrowed keypair/contacts from Firestore, if any. Never
+// throws — callers treat a null return as "no Firestore, proceed as before".
+async function readKeyEscrow(userId) {
+    if (!fsdb) return null;
+    try {
+        const snap = await fsdb.collection('users').doc(userId).get();
+        return snap.exists ? snap.data() : null;
+    } catch (e) { console.error('[CM-Relay] Firestore read failed:', e.message); return null; }
+}
+
+// Escrow a keypair (+ optional contacts) for this user. Best-effort: a write
+// failure must not fail registration, it just means the next device won't
+// find a stored key and will fall back to today's (key-rotating) behaviour.
+async function writeKeyEscrow(userId, { publicKeyJwk, privateKeyJwk, contacts }) {
+    if (!fsdb) return;
+    try {
+        const data = { publicKeyJwk, privateKeyJwk, updatedAt: new Date().toISOString() };
+        if (contacts !== undefined) data.contacts = contacts;
+        await fsdb.collection('users').doc(userId).set(data, { merge: true });
+    } catch (e) { console.error('[CM-Relay] Firestore write failed:', e.message); }
+}
+
 // Register / update profile
 app.post('/api/register', rateLimit('register'), async (req, res) => {
-    let { name, email, publicKey, canvasUserId, canvasUrl, canvasToken } = req.body || {};
+    let { name, email, publicKey, privateKey, canvasUserId, canvasUrl, canvasToken } = req.body || {};
     if (!name || !publicKey) return res.status(400).json({ error: 'name and publicKey required' });
     name = String(name).trim().slice(0, MAX_NAME_LEN);
     if (!name) return res.status(400).json({ error: 'name and publicKey required' });
@@ -220,10 +264,26 @@ app.post('/api/register', rateLimit('register'), async (req, res) => {
         existing.authToken = crypto.randomBytes(32).toString('hex');
         existing.name = name;
         existing.email = email || null;
-        existing.publicKey = publicKey;
+
+        // A second (or reinstalled) device just generated its own keypair and
+        // sent it as `publicKey`/`privateKey` — but if we already escrowed a
+        // real one for this account, that one wins: overwriting publicKey here
+        // would silently break decryption of every message anyone already
+        // encrypted for the escrowed key. Hand the caller the real keypair
+        // back instead so it can discard the one it just generated.
+        const escrow = await readKeyEscrow(existing.id);
+        let responseKeypair, responseContacts;
+        if (escrow?.publicKeyJwk && escrow?.privateKeyJwk) {
+            existing.publicKey = escrow.publicKeyJwk;
+            responseKeypair = { publicKeyJwk: JSON.parse(escrow.publicKeyJwk), privateKeyJwk: JSON.parse(escrow.privateKeyJwk) };
+            if (escrow.contacts) responseContacts = JSON.parse(escrow.contacts);
+        } else {
+            existing.publicKey = publicKey;
+            if (privateKey) await writeKeyEscrow(existing.id, { publicKeyJwk: publicKey, privateKeyJwk: privateKey });
+        }
         usersByToken.set(existing.authToken, existing);
         saveDb();
-        return res.json({ id: existing.id, authToken: existing.authToken });
+        return res.json({ id: existing.id, authToken: existing.authToken, keypair: responseKeypair, contacts: responseContacts });
     }
 
     const id = crypto.randomUUID();
@@ -235,7 +295,25 @@ app.post('/api/register', rateLimit('register'), async (req, res) => {
     usersByToken.set(authToken, user);
     if (canvasUserId && canvasUrl) usersByCanvasKey.set(canvasKey(canvasUrl, canvasUserId), user);
     saveDb();
+    if (privateKey) await writeKeyEscrow(id, { publicKeyJwk: publicKey, privateKeyJwk: privateKey });
     res.json({ id, authToken });
+});
+
+// Push an updated contacts list into this user's key escrow doc, so a future
+// device restores contacts (and can decrypt their backfilled messages)
+// instead of starting from zero. Best-effort, mirrors the relay's other
+// fire-and-forget sync calls.
+app.post('/api/sync-contacts', auth, rateLimit('register'), async (req, res) => {
+    const { contacts } = req.body || {};
+    if (!Array.isArray(contacts)) return res.status(400).json({ error: 'contacts array required' });
+    if (!fsdb) return res.json({ ok: true, synced: false });
+    const escrow = await readKeyEscrow(req.user.id);
+    if (!escrow?.publicKeyJwk) return res.json({ ok: true, synced: false }); // nothing to attach contacts to yet
+    await writeKeyEscrow(req.user.id, {
+        publicKeyJwk: escrow.publicKeyJwk, privateKeyJwk: escrow.privateKeyJwk,
+        contacts: JSON.stringify(contacts.slice(0, 500)),
+    });
+    res.json({ ok: true, synced: true });
 });
 
 // Current authenticated user's own identity — used by other services (e.g.
