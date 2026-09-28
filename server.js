@@ -133,6 +133,17 @@ app.use((req, res, next) => {
     next();
 });
 
+// db.users / db.invites are plain objects used as string-keyed maps, loaded
+// straight from JSON and indexed by attacker-supplied path/query/body values
+// (user id, recipientId, presence ids, invite token). A bare `obj[key]` on a
+// plain object also resolves inherited properties, so a key like "__proto__",
+// "constructor", "hasOwnProperty" etc. returns a truthy Object.prototype value
+// instead of undefined — silently bypassing "not found" checks. Route every
+// such lookup through this helper so only actual own entries count.
+function safeGet(obj, key) {
+    return (typeof key === 'string' && Object.prototype.hasOwnProperty.call(obj, key)) ? obj[key] : undefined;
+}
+
 function auth(req, res, next) {
     const token = (req.headers.authorization || '').replace('Bearer ', '');
     const user = usersByToken.get(token);
@@ -339,7 +350,7 @@ app.get('/api/users/search', auth, rateLimit('search'), (req, res) => {
 
 // Get user by ID
 app.get('/api/users/:id', auth, rateLimit('lookup'), (req, res) => {
-    const u = db.users[req.params.id];
+    const u = safeGet(db.users, req.params.id);
     if (!u) return res.status(404).json({ error: 'Not found' });
     res.json({ id: u.id, name: u.name, email: u.email, publicKey: u.publicKey });
 });
@@ -352,7 +363,7 @@ app.post('/api/messages', auth, rateLimit('messages'), (req, res) => {
         encryptedBody.length > MAX_CRYPTO_FIELD_LEN || iv.length > MAX_CRYPTO_FIELD_LEN) {
         return res.status(400).json({ error: 'Payload too large' });
     }
-    if (!db.users[recipientId]) return res.status(404).json({ error: 'Recipient not found' });
+    if (!safeGet(db.users, recipientId)) return res.status(404).json({ error: 'Recipient not found' });
 
     const threadId = [req.user.id, recipientId].sort().join('_');
     const id = crypto.randomUUID();
@@ -408,7 +419,7 @@ app.get('/api/presence', auth, rateLimit('presence'), (req, res) => {
     const ids = String(req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 50);
     const result = {};
     for (const id of ids) {
-        const u = db.users[id];
+        const u = safeGet(db.users, id);
         result[id] = { online: wsClients.has(id), lastSeen: u ? (u.lastSeen || null) : null };
     }
     res.json(result);
@@ -424,9 +435,9 @@ app.post('/api/invites', auth, rateLimit('invites'), (req, res) => {
 
 // Resolve invite
 app.get('/api/invites/:token', rateLimit('invite-lookup'), (req, res) => {
-    const inv = db.invites[req.params.token];
+    const inv = safeGet(db.invites, req.params.token);
     if (!inv) return res.status(404).json({ error: 'Invalid invite' });
-    const u = db.users[inv.creatorId];
+    const u = safeGet(db.users, inv.creatorId);
     if (!u) return res.status(404).json({ error: 'User not found' });
     res.json({ id: u.id, name: u.name, email: u.email, publicKey: u.publicKey });
 });
