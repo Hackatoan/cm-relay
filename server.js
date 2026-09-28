@@ -50,6 +50,29 @@ for (const u of Object.values(db.users)) {
     if (u.canvasUserId && u.canvasUrl) usersByCanvasKey.set(canvasKey(u.canvasUrl, u.canvasUserId), u);
 }
 
+// userId -> that user's messages (as sender or recipient), kept in sync with
+// db.messages. GET /api/messages is polled up to 300x/min per user (the
+// tightest limit of any REST route here) and was doing a full
+// Array.filter over the *entire* global log (up to 50,000 messages) just to
+// pull out one user's slice of it.
+const messagesByUser = new Map();
+function indexMessage(m) {
+    for (const uid of [m.senderId, m.recipientId]) {
+        let arr = messagesByUser.get(uid);
+        if (!arr) { arr = []; messagesByUser.set(uid, arr); }
+        arr.push(m);
+    }
+}
+function unindexMessage(m) {
+    for (const uid of [m.senderId, m.recipientId]) {
+        const arr = messagesByUser.get(uid);
+        if (!arr) continue;
+        const i = arr.indexOf(m);
+        if (i !== -1) arr.splice(i, 1);
+    }
+}
+for (const m of db.messages) indexMessage(m);
+
 function saveDb() {
     try {
         const tmp = DB_PATH + '.tmp';
@@ -359,7 +382,12 @@ app.post('/api/messages', auth, rateLimit('messages'), (req, res) => {
     const sentAt = new Date().toISOString();
     const message = { id, threadId, senderId: req.user.id, recipientId, encryptedBody, iv, sentAt, readAt: null };
     db.messages.push(message);
-    if (db.messages.length > 50000) db.messages = db.messages.slice(-50000);
+    indexMessage(message);
+    if (db.messages.length > 50000) {
+        const dropped = db.messages.slice(0, db.messages.length - 50000);
+        db.messages = db.messages.slice(-50000);
+        for (const m of dropped) unindexMessage(m);
+    }
     scheduleSave();
 
     const ws = wsClients.get(recipientId);
@@ -372,8 +400,8 @@ app.post('/api/messages', auth, rateLimit('messages'), (req, res) => {
 // Get messages since timestamp
 app.get('/api/messages', auth, rateLimit('messages-poll'), (req, res) => {
     const since = req.query.since || '1970-01-01T00:00:00.000Z';
-    const msgs = db.messages
-        .filter(m => (m.senderId === req.user.id || m.recipientId === req.user.id) && m.sentAt > since)
+    const msgs = (messagesByUser.get(req.user.id) || [])
+        .filter(m => m.sentAt > since)
         .slice(-500);
     res.json(msgs);
 });
