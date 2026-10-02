@@ -8,6 +8,7 @@ const dns = require('dns').promises;
 const net = require('net');
 const https = require('https');
 const admin = require('firebase-admin');
+const { registerAccountRoutes } = require('./account');
 
 const DB_PATH = '/data/relay.json';
 let db = { users: {}, messages: [], invites: {} };
@@ -46,6 +47,12 @@ for (const u of Object.values(db.users)) usersByToken.set(u.authToken, u);
 // Object.values(db.users).find(...) scan to find the account being reclaimed.
 const usersByCanvasKey = new Map();
 function canvasKey(url, id) { return JSON.stringify([url, id]); }
+
+// Firebase Auth uid -> relay user, for accounts linked via /api/account/*.
+const usersByFirebaseUid = new Map();
+for (const u of Object.values(db.users)) {
+    if (u.firebaseUid) usersByFirebaseUid.set(u.firebaseUid, u);
+}
 for (const u of Object.values(db.users)) {
     if (u.canvasUserId && u.canvasUrl) usersByCanvasKey.set(canvasKey(u.canvasUrl, u.canvasUserId), u);
 }
@@ -128,6 +135,7 @@ function withinLimit(bucketMap, key, windowMs, max) {
 // Per-IP sliding-window rate limiter for abuse-prone REST endpoints.
 const RATE_LIMITS = {
     register:        { windowMs: 60_000, max: 10 },
+    account:         { windowMs: 60_000, max: 20 },
     messages:        { windowMs: 60_000, max: 120 },
     invites:         { windowMs: 60_000, max: 20 },
     'invite-lookup': { windowMs: 60_000, max: 30 },  // unauthenticated — no other friction on this route
@@ -164,7 +172,7 @@ const app = express();
 app.use(express.json({ limit: '4mb' }));
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Firebase-Token');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
@@ -362,6 +370,18 @@ app.post('/api/sync-contacts', auth, rateLimit('register'), async (req, res) => 
         contacts: JSON.stringify(contacts.slice(0, 500)),
     });
     res.json({ ok: true, synced: true });
+});
+
+// Firebase-Auth-backed accounts (sign in on a new device without redoing the
+// Canvas token flow). See account.js.
+registerAccountRoutes(app, {
+    auth, rateLimit, db, saveDb, usersByFirebaseUid, fsdb,
+    readKeyEscrow, verifyCanvasIdentity,
+    encKey: process.env.ACCOUNT_ENC_KEY,
+    verifyIdToken: async token => {
+        if (!fsdb) throw new Error('firebase not configured');
+        return admin.auth().verifyIdToken(token, true);
+    },
 });
 
 // Current authenticated user's own identity — used by other services (e.g.
