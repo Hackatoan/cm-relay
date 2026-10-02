@@ -56,17 +56,31 @@ for (const u of Object.values(db.users)) {
 // Array.filter over the *entire* global log (up to 50,000 messages) just to
 // pull out one user's slice of it.
 const messagesByUser = new Map();
+
+// threadId -> that thread's messages, kept in sync with db.messages.
+// POST /api/messages/read was iterating the entire global log to find messages
+// in a specific thread — with up to 50,000 messages, that's expensive.
+const messagesByThread = new Map();
+
 function indexMessage(m) {
     for (const uid of [m.senderId, m.recipientId]) {
         let arr = messagesByUser.get(uid);
         if (!arr) { arr = []; messagesByUser.set(uid, arr); }
         arr.push(m);
     }
+    let arr = messagesByThread.get(m.threadId);
+    if (!arr) { arr = []; messagesByThread.set(m.threadId, arr); }
+    arr.push(m);
 }
 function unindexMessage(m) {
     for (const uid of [m.senderId, m.recipientId]) {
         const arr = messagesByUser.get(uid);
         if (!arr) continue;
+        const i = arr.indexOf(m);
+        if (i !== -1) arr.splice(i, 1);
+    }
+    const arr = messagesByThread.get(m.threadId);
+    if (arr) {
         const i = arr.indexOf(m);
         if (i !== -1) arr.splice(i, 1);
     }
@@ -425,8 +439,9 @@ app.post('/api/messages/read', auth, rateLimit('messages-read'), (req, res) => {
     const readAt = new Date().toISOString();
     let updated = 0;
     let senderId = null;
-    for (const m of db.messages) {
-        if (m.threadId === threadId && m.recipientId === req.user.id && !m.readAt) {
+    const msgs = messagesByThread.get(threadId) || [];
+    for (const m of msgs) {
+        if (m.recipientId === req.user.id && !m.readAt) {
             m.readAt = readAt;
             senderId = m.senderId;
             updated++;
@@ -518,8 +533,9 @@ wss.on('connection', (ws, req) => {
             // reconnecting (e.g. a second tab) overwrites the entry with the new
             // socket, and the old socket's close event must not evict it.
             if (wsClients.get(userId) === ws) wsClients.delete(userId);
-            if (db.users[userId]) {
-                db.users[userId].lastSeen = new Date().toISOString();
+            const u = safeGet(db.users, userId);
+            if (u) {
+                u.lastSeen = new Date().toISOString();
                 scheduleSave();
             }
         }
