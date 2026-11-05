@@ -429,9 +429,11 @@ app.post('/api/messages', auth, rateLimit('messages'), (req, res) => {
     db.messages.push(message);
     indexMessage(message);
     if (db.messages.length > 50000) {
-        const dropped = db.messages.slice(0, db.messages.length - 50000);
+        const toDropCount = db.messages.length - 50000;
+        for (let i = 0; i < toDropCount; i++) {
+            unindexMessage(db.messages[i]);
+        }
         db.messages = db.messages.slice(-50000);
-        for (const m of dropped) unindexMessage(m);
     }
     scheduleSave();
 
