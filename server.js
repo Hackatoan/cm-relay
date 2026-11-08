@@ -433,7 +433,10 @@ app.post('/api/messages', auth, rateLimit('messages'), (req, res) => {
         for (let i = 0; i < toDropCount; i++) {
             unindexMessage(db.messages[i]);
         }
-        db.messages = db.messages.slice(-50000);
+        // Trim in place: once the log is at the cap this runs on *every* send
+        // (dropping one message), and slice(-50000) was allocating and copying
+        // a fresh 50,000-element array each time just to discard the old one.
+        db.messages.splice(0, toDropCount);
     }
     scheduleSave();
 
