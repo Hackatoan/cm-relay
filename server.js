@@ -10,9 +10,45 @@ const https = require('https');
 const admin = require('firebase-admin');
 const { registerAccountRoutes } = require('./account');
 
-const DB_PATH = '/data/relay.json';
-let db = { users: {}, messages: [], invites: {} };
-try { db = JSON.parse(fs.readFileSync(DB_PATH, 'utf8')); } catch {}
+const DB_PATH = process.env.RELAY_DB_PATH || '/data/relay.json';
+
+// Previously any load failure silently started an empty db, and the first
+// save then overwrote relay.json — turning a truncated/unreadable file (e.g.
+// after a power loss or disk-full) into permanent loss of every account and
+// message. Now: a missing file starts fresh; a corrupt one is preserved
+// beside the original before starting fresh; any other read error (EACCES,
+// EIO, ...) aborts startup rather than clobbering data we couldn't read.
+function loadDb() {
+    const empty = () => ({ users: {}, messages: [], invites: {} });
+    let raw;
+    try { raw = fs.readFileSync(DB_PATH, 'utf8'); }
+    catch (e) {
+        if (e.code === 'ENOENT') return empty();
+        console.error(`[CM-Relay] cannot read ${DB_PATH} (${e.code || e.message}) — refusing to start and overwrite it`);
+        process.exit(1);
+    }
+    try {
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a JSON object');
+        const isMap = v => !!v && typeof v === 'object' && !Array.isArray(v);
+        return {
+            ...parsed,
+            users: isMap(parsed.users) ? parsed.users : {},
+            messages: Array.isArray(parsed.messages) ? parsed.messages : [],
+            invites: isMap(parsed.invites) ? parsed.invites : {},
+        };
+    } catch (e) {
+        const backup = `${DB_PATH}.corrupt-${Date.now()}`;
+        try { fs.copyFileSync(DB_PATH, backup); }
+        catch (e2) {
+            console.error(`[CM-Relay] ${DB_PATH} is corrupt (${e.message}) and could not be backed up (${e2.message}) — refusing to start`);
+            process.exit(1);
+        }
+        console.error(`[CM-Relay] ${DB_PATH} is corrupt (${e.message}); preserved as ${backup}, starting with an empty db`);
+        return empty();
+    }
+}
+let db = loadDb();
 
 // Firestore is used only as cross-device escrow for each user's long-term
 // ECDH keypair (+ their contacts list) — everything else (accounts, messages)
@@ -104,7 +140,11 @@ for (const m of db.messages) indexMessage(m);
 function saveDb() {
     try {
         const tmp = DB_PATH + '.tmp';
-        fs.writeFileSync(tmp, JSON.stringify(db));
+        const fd = fs.openSync(tmp, 'w');
+        try {
+            fs.writeFileSync(fd, JSON.stringify(db));
+            fs.fsyncSync(fd); // data on disk before the rename makes it live
+        } finally { fs.closeSync(fd); }
         fs.renameSync(tmp, DB_PATH);
     } catch (e) { console.error('[CM-Relay] saveDb error:', e.message); }
 }
