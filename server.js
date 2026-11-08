@@ -412,10 +412,20 @@ async function writeKeyEscrow(userId, { publicKeyJwk, privateKeyJwk, contacts })
     } catch (e) { console.error('[CM-Relay] Firestore write failed:', e.message); }
 }
 
+// Express 4 doesn't route a rejected promise from an async handler to the
+// error middleware: it becomes an unhandledRejection and Node exits, so one
+// bad request could take the whole relay down. Forward rejections to next().
+const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
 // Register / update profile
-app.post('/api/register', rateLimit('register'), async (req, res) => {
+app.post('/api/register', rateLimit('register'), asyncRoute(async (req, res) => {
     let { name, email, publicKey, privateKey, canvasUserId, canvasUrl, canvasToken } = req.body || {};
     if (!name || !publicKey) return res.status(400).json({ error: 'name and publicKey required' });
+    // Coercing an attacker-shaped object/array with String() can itself throw
+    // (e.g. a deeply nested array overflows the stack), so require strings.
+    if (typeof name !== 'string' || (email != null && typeof email !== 'string')) {
+        return res.status(400).json({ error: 'Invalid name or email' });
+    }
     name = String(name).trim().slice(0, MAX_NAME_LEN);
     if (!name) return res.status(400).json({ error: 'name and publicKey required' });
     if (email) email = String(email).trim().slice(0, MAX_EMAIL_LEN);
@@ -501,13 +511,13 @@ app.post('/api/register', rateLimit('register'), async (req, res) => {
     scheduleSave();
     if (privateKey) await writeKeyEscrow(id, { publicKeyJwk: publicKey, privateKeyJwk: privateKey });
     res.json({ id, authToken });
-});
+}));
 
 // Push an updated contacts list into this user's key escrow doc, so a future
 // device restores contacts (and can decrypt their backfilled messages)
 // instead of starting from zero. Best-effort, mirrors the relay's other
 // fire-and-forget sync calls.
-app.post('/api/sync-contacts', auth, rateLimit('register'), async (req, res) => {
+app.post('/api/sync-contacts', auth, rateLimit('register'), asyncRoute(async (req, res) => {
     const { contacts } = req.body || {};
     if (!Array.isArray(contacts)) return res.status(400).json({ error: 'contacts array required' });
     if (!fsdb) return res.json({ ok: true, synced: false });
@@ -518,7 +528,7 @@ app.post('/api/sync-contacts', auth, rateLimit('register'), async (req, res) => 
         contacts: JSON.stringify(contacts.slice(0, 500)),
     });
     res.json({ ok: true, synced: true });
-});
+}));
 
 // Firebase-Auth-backed accounts (sign in on a new device without redoing the
 // Canvas token flow). See account.js.
