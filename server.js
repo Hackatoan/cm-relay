@@ -112,10 +112,17 @@ function saveDb() {
 // Debounce disk writes under bursty traffic (e.g. a flurry of messages) instead
 // of doing a synchronous write per request; flushSave() forces it immediately
 // (used on graceful shutdown so a redeploy never loses the last write).
+//
+// saveDb() re-serializes the *whole* DB synchronously (~175 ms for a ~34 MB
+// file at the 50k-message cap), so under steady traffic a 250 ms window kept
+// the event loop blocked most of the time. 2 s cuts that ~8x; the trade-off
+// is a wider window of writes lost on a hard crash (graceful stop still
+// flushes).
+const SAVE_DEBOUNCE_MS = 2_000;
 let saveTimer = null;
 function scheduleSave() {
     if (saveTimer) return;
-    saveTimer = setTimeout(() => { saveTimer = null; saveDb(); }, 250);
+    saveTimer = setTimeout(() => { saveTimer = null; saveDb(); }, SAVE_DEBOUNCE_MS);
 }
 function flushSave() {
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
