@@ -75,12 +75,18 @@ function registerAccountRoutes(app, deps) {
     }
 
     const str = v => (typeof v === 'string' && v.length > 0 && v.length <= MAX_FIELD) ? v : null;
+    // Canvas user ids arrive as a string or a number; anything else (objects,
+    // arrays) is rejected rather than String()-coerced, which can throw.
+    const idStr = v => str(typeof v === 'number' && Number.isFinite(v) ? String(v) : v);
+    // Express 4 doesn't forward rejected promises from async handlers to the
+    // error middleware; an unhandled rejection would crash the relay.
+    const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
     // Attach (or refresh) the Canvas token for the signed-in account. Called
     // from a device that is already registered with the relay.
-    app.post('/api/account/link', rateLimit('account'), ready, auth, fbAuth, async (req, res) => {
+    app.post('/api/account/link', rateLimit('account'), ready, auth, fbAuth, asyncRoute(async (req, res) => {
         const canvasUrl = str(req.body?.canvasUrl);
-        const canvasUserId = str(String(req.body?.canvasUserId ?? ''));
+        const canvasUserId = idStr(req.body?.canvasUserId);
         const canvasToken = str(req.body?.canvasToken);
         if (!canvasUrl || !canvasUserId || !canvasToken) return res.status(400).json({ error: 'canvasUrl, canvasUserId and canvasToken required' });
 
@@ -115,10 +121,10 @@ function registerAccountRoutes(app, deps) {
             saveDb();
         }
         res.json({ ok: true });
-    });
+    }));
 
     // New device: trade a Firebase sign-in for everything needed to resume.
-    app.post('/api/account/login', rateLimit('account'), ready, fbAuth, async (req, res) => {
+    app.post('/api/account/login', rateLimit('account'), ready, fbAuth, asyncRoute(async (req, res) => {
         const user = usersByFirebaseUid.get(req.fb.uid);
         if (!user) return res.status(404).json({ error: 'no_account' });
 
@@ -152,11 +158,11 @@ function registerAccountRoutes(app, deps) {
         // Same authToken is returned (not rotated): other signed-in devices
         // keep working, and the caller has just proven identity via Firebase.
         res.json({ id: user.id, authToken: user.authToken, name: user.name, email: user.email, keypair, contacts, canvas });
-    });
+    }));
 
     // Remove the cloud copy: unlink the sign-in and delete the sealed Canvas
     // token. The relay account, messages and key escrow are left alone.
-    app.post('/api/account/unlink', rateLimit('account'), ready, fbAuth, async (req, res) => {
+    app.post('/api/account/unlink', rateLimit('account'), ready, fbAuth, asyncRoute(async (req, res) => {
         const user = usersByFirebaseUid.get(req.fb.uid);
         try { await fsdb.collection('accounts').doc(req.fb.uid).delete(); }
         catch (e) {
@@ -169,7 +175,7 @@ function registerAccountRoutes(app, deps) {
             saveDb();
         }
         res.json({ ok: true });
-    });
+    }));
 }
 
 module.exports = { registerAccountRoutes, makeSealer };
