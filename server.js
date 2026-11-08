@@ -491,12 +491,17 @@ app.post('/api/messages/read', auth, rateLimit('messages-read'), (req, res) => {
     let updated = 0;
     let senderId = null;
     const msgs = messagesByThread.get(threadId) || [];
-    for (const m of msgs) {
-        if (m.recipientId === req.user.id && !m.readAt) {
-            m.readAt = readAt;
-            senderId = m.senderId;
-            updated++;
-        }
+    // readAt is only ever set here, for *every* unread message to me in the
+    // thread at once, so my unread messages are always a suffix of the ones
+    // addressed to me. Walk back from the newest and stop at the first one
+    // already read, instead of rescanning the whole thread history each time.
+    for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (m.recipientId !== req.user.id) continue;
+        if (m.readAt) break;
+        m.readAt = readAt;
+        if (!senderId) senderId = m.senderId; // newest, as before
+        updated++;
     }
     if (updated > 0) {
         scheduleSave();
