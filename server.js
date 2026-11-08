@@ -312,6 +312,11 @@ function fetchPinned(hostname, port, ip, path, token) {
             });
             res.on('end', () => resolve({ status: res.statusCode, body }));
         });
+        // `timeout` above is only a socket *idle* timeout: a server that drips
+        // a byte every few seconds would keep this (and the /api/register
+        // request awaiting it) open indefinitely. Enforce a total deadline too.
+        const deadline = setTimeout(() => req.destroy(new Error('deadline exceeded')), CANVAS_VERIFY_TIMEOUT_MS * 2);
+        req.on('close', () => clearTimeout(deadline));
         req.on('timeout', () => req.destroy(new Error('timeout')));
         req.on('error', reject);
         req.end();
