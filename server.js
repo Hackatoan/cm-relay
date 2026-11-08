@@ -175,6 +175,17 @@ const MAX_IV_LEN = 64;                // AES-GCM 12-byte IV is 16 base64 chars
 // this budget (far above what normal text traffic produces).
 const MAX_MESSAGE_LOG = 50_000;
 const MAX_MESSAGE_LOG_BYTES = 64 * 1024 * 1024;
+const MAX_JWK_LEN = 4096;           // JSON-serialized P-256 JWK is a few hundred chars
+const MAX_CANVAS_FIELD_LEN = 2048;
+
+// publicKey/privateKey arrive as JSON-serialized JWKs. They're stored and
+// later JSON.parse'd (escrow restore), served to other users (search/lookup),
+// and written to relay.json/Firestore — so accept only a bounded string that
+// actually parses to an object.
+function isJwkString(v) {
+    if (typeof v !== 'string' || v.length > MAX_JWK_LEN) return false;
+    try { const o = JSON.parse(v); return !!o && typeof o === 'object' && !Array.isArray(o); } catch { return false; }
+}
 
 // Simple in-memory sliding-window counter shared by the REST rate limiter
 // below and the WebSocket connect/message limiters further down.
@@ -362,6 +373,15 @@ app.post('/api/register', rateLimit('register'), async (req, res) => {
     name = String(name).trim().slice(0, MAX_NAME_LEN);
     if (!name) return res.status(400).json({ error: 'name and publicKey required' });
     if (email) email = String(email).trim().slice(0, MAX_EMAIL_LEN);
+    if (!isJwkString(publicKey) || (privateKey != null && !isJwkString(privateKey))) {
+        return res.status(400).json({ error: 'Invalid key format' });
+    }
+    if ((canvasUrl != null && (typeof canvasUrl !== 'string' || canvasUrl.length > MAX_CANVAS_FIELD_LEN)) ||
+        (canvasUserId != null && !((typeof canvasUserId === 'string' && canvasUserId.length <= MAX_CANVAS_FIELD_LEN) ||
+            Number.isSafeInteger(canvasUserId))) ||
+        (canvasToken != null && (typeof canvasToken !== 'string' || canvasToken.length > MAX_CANVAS_FIELD_LEN))) {
+        return res.status(400).json({ error: 'Invalid Canvas fields' });
+    }
 
     let existing = canvasUserId && canvasUrl
         ? usersByCanvasKey.get(canvasKey(canvasUrl, canvasUserId))
@@ -388,9 +408,17 @@ app.post('/api/register', rateLimit('register'), async (req, res) => {
         const escrow = await readKeyEscrow(existing.id);
         let responseKeypair, responseContacts;
         if (escrow?.publicKeyJwk && escrow?.privateKeyJwk) {
+            // A throw here would be an unhandled rejection (Express 4 doesn't
+            // catch async handlers), which takes the whole process down.
+            try {
+                responseKeypair = { publicKeyJwk: JSON.parse(escrow.publicKeyJwk), privateKeyJwk: JSON.parse(escrow.privateKeyJwk) };
+            } catch {
+                console.error('[CM-Relay] unreadable key escrow for user', existing.id, '— replacing with caller keypair');
+            }
+        }
+        if (responseKeypair) {
             existing.publicKey = escrow.publicKeyJwk;
-            responseKeypair = { publicKeyJwk: JSON.parse(escrow.publicKeyJwk), privateKeyJwk: JSON.parse(escrow.privateKeyJwk) };
-            if (escrow.contacts) responseContacts = JSON.parse(escrow.contacts);
+            try { if (escrow.contacts) responseContacts = JSON.parse(escrow.contacts); } catch { /* skip corrupt contacts */ }
         } else {
             existing.publicKey = publicKey;
             if (privateKey) await writeKeyEscrow(existing.id, { publicKeyJwk: publicKey, privateKeyJwk: privateKey });
