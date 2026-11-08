@@ -176,6 +176,7 @@ setInterval(() => {
 }, 5 * 60_000).unref();
 
 const app = express();
+app.disable('x-powered-by');
 app.use(express.json({ limit: '4mb' }));
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
@@ -533,6 +534,18 @@ app.get('/api/invites/:token', rateLimit('invite-lookup'), (req, res) => {
     const u = safeGet(db.users, inv.creatorId);
     if (!u) return res.status(404).json({ error: 'User not found' });
     res.json({ id: u.id, name: u.name, email: u.email, publicKey: u.publicKey });
+});
+
+// Final error handler. Without it, Express's default handler answers errors
+// (e.g. a malformed JSON body from express.json()) with an HTML page that
+// includes the stack trace and server file paths unless NODE_ENV=production.
+// Keep the status for client errors (4xx from body-parser), log the rest.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+    const status = Number.isInteger(err?.status) && err.status >= 400 && err.status < 500 ? err.status : 500;
+    if (status === 500) console.error('[CM-Relay] unhandled route error:', err?.stack || err);
+    if (res.headersSent) return;
+    res.status(status).json({ error: status === 500 ? 'Internal server error' : 'Bad request' });
 });
 
 // WebSocket real-time delivery
