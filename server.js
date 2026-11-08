@@ -425,6 +425,7 @@ app.post('/api/register', rateLimit('register'), async (req, res) => {
         // old one (e.g. via this same endpoint before this fix existed) must
         // not keep standing access just because the real owner re-registered.
         usersByToken.delete(existing.authToken);
+        revokeWsSessions(existing.authToken);
         existing.authToken = crypto.randomBytes(32).toString('hex');
         existing.name = name;
         existing.email = email || null;
@@ -692,6 +693,17 @@ const WS_MAX_PAYLOAD = 16 * 1024;
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: WS_MAX_PAYLOAD });
 const wsClients = new Map();
 
+// Rotating a token (verified reclaim in /api/register) must also cut off
+// realtime sessions that authenticated with the old one — otherwise a socket
+// opened by whoever held the old token keeps receiving pushes indefinitely
+// (the heartbeat keeps it alive).
+function revokeWsSessions(oldToken) {
+    if (!oldToken) return;
+    for (const ws of wss.clients) {
+        if (ws.authToken === oldToken) ws.close(4001, 'Session revoked');
+    }
+}
+
 wss.on('connection', (ws, req) => {
     const ip = req.socket.remoteAddress || 'unknown';
     if (!withinLimit(wsConnectBuckets, ip, WS_CONNECT_LIMIT.windowMs, WS_CONNECT_LIMIT.max)) {
@@ -715,6 +727,7 @@ wss.on('connection', (ws, req) => {
                 const user = usersByToken.get(msg.token);
                 if (user) {
                     userId = user.id;
+                    ws.authToken = msg.token;
                     wsClients.set(userId, ws);
                     ws.send(JSON.stringify({ type: 'auth-ok', userId }));
                 }
