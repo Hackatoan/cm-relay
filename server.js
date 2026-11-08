@@ -580,10 +580,26 @@ app.get('/api/presence', auth, rateLimit('presence'), (req, res) => {
     res.json(result);
 });
 
+// Invites never expire, so without a bound every account could grow
+// db.invites (and every relay.json rewrite) without limit, 20/min at a time.
+// Keep each user's newest MAX_INVITES_PER_USER links; creating one more
+// retires that user's oldest.
+const MAX_INVITES_PER_USER = 50;
+const invitesByCreator = new Map(); // creatorId -> tokens, oldest first
+for (const [token, inv] of Object.entries(db.invites).sort(([, a], [, b]) => String(a?.createdAt).localeCompare(String(b?.createdAt)))) {
+    let arr = invitesByCreator.get(inv?.creatorId);
+    if (!arr) { arr = []; invitesByCreator.set(inv?.creatorId, arr); }
+    arr.push(token);
+}
+
 // Create invite token
 app.post('/api/invites', auth, rateLimit('invites'), (req, res) => {
     const token = crypto.randomBytes(16).toString('hex');
     db.invites[token] = { token, creatorId: req.user.id, createdAt: new Date().toISOString() };
+    let mine = invitesByCreator.get(req.user.id);
+    if (!mine) { mine = []; invitesByCreator.set(req.user.id, mine); }
+    mine.push(token);
+    while (mine.length > MAX_INVITES_PER_USER) delete db.invites[mine.shift()];
     saveDb();
     res.json({ token });
 });
