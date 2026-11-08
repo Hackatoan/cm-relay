@@ -31,6 +31,7 @@ async function setup({ encKey = KEY, canvasOk = true, withFs = true } = {}) {
     const byToken = new Map([[alice.authToken, alice], [bob.authToken, bob]]);
     const usersByFirebaseUid = new Map();
     let saves = 0;
+    let escrowDelay = 0;
     const app = express();
     app.use(express.json());
     registerAccountRoutes(app, {
@@ -42,7 +43,7 @@ async function setup({ encKey = KEY, canvasOk = true, withFs = true } = {}) {
         rateLimit: () => (req, res, next) => next(),
         db, saveDb: () => { saves++; }, usersByFirebaseUid,
         fsdb: withFs ? fs : null,
-        readKeyEscrow: async id => id === 'u-alice'
+        readKeyEscrow: async id => (escrowDelay && await new Promise(r => setTimeout(r, escrowDelay)), id === 'u-alice')
             ? { publicKeyJwk: '{"k":"pub"}', privateKeyJwk: '{"k":"priv"}', contacts: '[{"id":"c1"}]' } : null,
         verifyCanvasIdentity: async () => canvasOk,
         encKey,
@@ -59,7 +60,7 @@ async function setup({ encKey = KEY, canvasOk = true, withFs = true } = {}) {
         headers: { 'Content-Type': 'application/json', ...(relay ? { Authorization: `Bearer ${relay}` } : {}), ...(fb ? { 'X-Firebase-Token': fb } : {}) },
         body: JSON.stringify(body || {}),
     }).then(async r => ({ status: r.status, json: await r.json() }));
-    return { call, fs, db, alice, bob, usersByFirebaseUid, saves: () => saves, close: () => server.close() };
+    return { call, fs, db, alice, bob, usersByFirebaseUid, saves: () => saves, setEscrowDelay: ms => { escrowDelay = ms; }, close: () => server.close() };
 }
 
 const LINK = { canvasUrl: 'https://school.instructure.com', canvasUserId: '42', canvasToken: 'canvas-secret-token' };
@@ -162,4 +163,23 @@ test('routes answer 503 when Firestore or the sealing key is missing', async t =
     assert.equal((await noKey.call('/api/account/login', { fb: 'fb-alice' })).status, 503);
     const noFs = await setup({ withFs: false }); t.after(noFs.close);
     assert.equal((await noFs.call('/api/account/link', { relay: 'relay-alice', fb: 'fb-alice', body: LINK })).status, 503);
+});
+
+test('login fetches the account doc and key escrow concurrently', async t => {
+    const c = await setup(); t.after(c.close);
+    await c.call('/api/account/link', { relay: 'relay-alice', fb: 'fb-alice', body: LINK });
+    // Slow both reads down; sequential would take ~2x the delay.
+    const DELAY = 150;
+    const origDoc = c.fs.collection;
+    c.fs.collection = name => {
+        const col = origDoc(name);
+        return { doc: id => { const d = col.doc(id); return { ...d, get: async () => { await new Promise(r => setTimeout(r, DELAY)); return d.get(); } }; } };
+    };
+    c.setEscrowDelay(DELAY);
+    const t0 = Date.now();
+    const r = await c.call('/api/account/login', { fb: 'fb-alice' });
+    const elapsed = Date.now() - t0;
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json.keypair, { publicKeyJwk: { k: 'pub' }, privateKeyJwk: { k: 'priv' } });
+    assert.ok(elapsed < DELAY * 2 - 30, `expected concurrent reads, took ${elapsed}ms`);
 });
