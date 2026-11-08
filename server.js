@@ -521,7 +521,11 @@ app.get('/api/invites/:token', rateLimit('invite-lookup'), (req, res) => {
 
 // WebSocket real-time delivery
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
+// The relay WS only ever carries tiny control frames ('auth', 'typing');
+// message bodies go over REST. Without an explicit cap, ws accepts frames up
+// to 100 MiB, each of which is buffered and JSON.parse'd before any check.
+const WS_MAX_PAYLOAD = 16 * 1024;
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: WS_MAX_PAYLOAD });
 const wsClients = new Map();
 
 wss.on('connection', (ws, req) => {
