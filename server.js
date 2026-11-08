@@ -397,11 +397,20 @@ app.get('/api/me', auth, (req, res) => {
 app.get('/api/users/search', auth, rateLimit('search'), (req, res) => {
     const q = String(req.query.q || '').toLowerCase().trim();
     if (q.length < 2) return res.json([]);
-    const results = Object.values(db.users)
-        .filter(u => u.id !== req.user.id &&
-            (u.name.toLowerCase().includes(q) || (u.email || '').toLowerCase().includes(q)))
-        .slice(0, 20)
-        .map(u => ({ id: u.id, name: u.name, email: u.email, publicKey: u.publicKey }));
+    // Stop at the 20th match instead of lowercasing + substring-matching the
+    // name/email of every user in the table just to keep the first 20. for-in
+    // (not Object.values) so a match near the front doesn't still pay to copy
+    // the whole user table into a temporary array first.
+    const results = [];
+    for (const id in db.users) {
+        if (!Object.prototype.hasOwnProperty.call(db.users, id)) continue;
+        const u = db.users[id];
+        if (u.id !== req.user.id &&
+            (u.name.toLowerCase().includes(q) || (u.email || '').toLowerCase().includes(q))) {
+            results.push({ id: u.id, name: u.name, email: u.email, publicKey: u.publicKey });
+            if (results.length === 20) break;
+        }
+    }
     res.json(results);
 });
 
