@@ -135,7 +135,10 @@ function unindexMessage(m) {
         if (i !== -1) arr.splice(i, 1);
     }
 }
-for (const m of db.messages) indexMessage(m);
+// Approximate in-memory/on-disk size of one stored message (see MAX_MESSAGE_LOG_BYTES).
+const messageBytes = m => (m.encryptedBody?.length || 0) + (m.iv?.length || 0) + 256; // + ids/timestamps
+let messageLogBytes = 0;
+for (const m of db.messages) { indexMessage(m); messageLogBytes += messageBytes(m); }
 
 function saveDb() {
     try {
@@ -164,7 +167,14 @@ function flushSave() {
 
 const MAX_NAME_LEN = 100;
 const MAX_EMAIL_LEN = 200;
-const MAX_CRYPTO_FIELD_LEN = 100_000; // base64 ciphertext / iv safety cap
+const MAX_CRYPTO_FIELD_LEN = 100_000; // base64 ciphertext safety cap
+const MAX_IV_LEN = 64;                // AES-GCM 12-byte IV is 16 base64 chars
+// The 50,000-message cap alone bounds the log by count, not size: at the
+// per-field cap that's several GB held in memory and rewritten to relay.json
+// on every save. Also evict oldest-first once the log's payload bytes pass
+// this budget (far above what normal text traffic produces).
+const MAX_MESSAGE_LOG = 50_000;
+const MAX_MESSAGE_LOG_BYTES = 64 * 1024 * 1024;
 
 // Simple in-memory sliding-window counter shared by the REST rate limiter
 // below and the WebSocket connect/message limiters further down.
@@ -474,7 +484,7 @@ app.post('/api/messages', auth, rateLimit('messages'), (req, res) => {
     const { recipientId, encryptedBody, iv } = req.body || {};
     if (!recipientId || !encryptedBody || !iv) return res.status(400).json({ error: 'Missing fields' });
     if (typeof encryptedBody !== 'string' || typeof iv !== 'string' ||
-        encryptedBody.length > MAX_CRYPTO_FIELD_LEN || iv.length > MAX_CRYPTO_FIELD_LEN) {
+        encryptedBody.length > MAX_CRYPTO_FIELD_LEN || iv.length > MAX_IV_LEN) {
         return res.status(400).json({ error: 'Payload too large' });
     }
     if (!safeGet(db.users, recipientId)) return res.status(404).json({ error: 'Recipient not found' });
@@ -485,8 +495,14 @@ app.post('/api/messages', auth, rateLimit('messages'), (req, res) => {
     const message = { id, threadId, senderId: req.user.id, recipientId, encryptedBody, iv, sentAt, readAt: null };
     db.messages.push(message);
     indexMessage(message);
-    if (db.messages.length > 50000) {
-        const toDropCount = db.messages.length - 50000;
+    messageLogBytes += messageBytes(message);
+    if (db.messages.length > MAX_MESSAGE_LOG || messageLogBytes > MAX_MESSAGE_LOG_BYTES) {
+        let toDropCount = Math.max(0, db.messages.length - MAX_MESSAGE_LOG);
+        for (let i = 0; i < toDropCount; i++) messageLogBytes -= messageBytes(db.messages[i]);
+        // Keep at least the message just sent.
+        while (messageLogBytes > MAX_MESSAGE_LOG_BYTES && toDropCount < db.messages.length - 1) {
+            messageLogBytes -= messageBytes(db.messages[toDropCount++]);
+        }
         for (let i = 0; i < toDropCount; i++) {
             unindexMessage(db.messages[i]);
         }
