@@ -483,7 +483,10 @@ app.post('/api/register', rateLimit('register'), async (req, res) => {
             if (privateKey) await writeKeyEscrow(existing.id, { publicKeyJwk: publicKey, privateKeyJwk: privateKey });
         }
         usersByToken.set(existing.authToken, existing);
-        saveDb();
+        // Debounced like message writes: a full synchronous saveDb() here
+        // re-serialized the whole log (tens of MB at the 50k cap) and blocked
+        // the event loop on every extension install/reload.
+        scheduleSave();
         return res.json({ id: existing.id, authToken: existing.authToken, keypair: responseKeypair, contacts: responseContacts });
     }
 
@@ -495,7 +498,7 @@ app.post('/api/register', rateLimit('register'), async (req, res) => {
     db.users[id] = user;
     usersByToken.set(authToken, user);
     if (hasCanvasIdentity) usersByCanvasKey.set(canvasKey(canvasUrl, canvasUserId), user);
-    saveDb();
+    scheduleSave();
     if (privateKey) await writeKeyEscrow(id, { publicKeyJwk: publicKey, privateKeyJwk: privateKey });
     res.json({ id, authToken });
 });
@@ -687,7 +690,7 @@ app.post('/api/invites', auth, rateLimit('invites'), (req, res) => {
     if (!mine) { mine = []; invitesByCreator.set(req.user.id, mine); }
     mine.push(token);
     while (mine.length > MAX_INVITES_PER_USER) delete db.invites[mine.shift()];
-    saveDb();
+    scheduleSave();
     res.json({ token });
 });
 
