@@ -232,6 +232,11 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Firebase-Token');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    // Responses carry bearer tokens, escrowed key material and message
+    // ciphertext: never let a browser, proxy or CDN cache them, and don't
+    // let browsers content-sniff the JSON as something executable.
+    res.header('Cache-Control', 'no-store');
+    res.header('X-Content-Type-Options', 'nosniff');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
 });
