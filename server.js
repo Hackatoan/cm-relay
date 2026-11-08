@@ -63,6 +63,11 @@ for (const u of Object.values(db.users)) {
 // Array.filter over the *entire* global log (up to 50,000 messages) just to
 // pull out one user's slice of it.
 const messagesByUser = new Map();
+// Users whose messagesByUser slice is NOT in ascending sentAt order (only
+// possible if the wall clock stepped backwards between two sends, or a
+// legacy record has no string sentAt). Every other slice is sorted, which
+// lets GET /api/messages binary-search `since`.
+const unsortedUsers = new Set();
 
 // threadId -> that thread's messages, kept in sync with db.messages.
 // POST /api/messages/read was iterating the entire global log to find messages
@@ -73,6 +78,8 @@ function indexMessage(m) {
     for (const uid of [m.senderId, m.recipientId]) {
         let arr = messagesByUser.get(uid);
         if (!arr) { arr = []; messagesByUser.set(uid, arr); }
+        if (typeof m.sentAt !== 'string' ||
+            (arr.length && arr[arr.length - 1].sentAt > m.sentAt)) unsortedUsers.add(uid);
         arr.push(m);
     }
     let arr = messagesByThread.get(m.threadId);
@@ -459,10 +466,19 @@ app.post('/api/messages', auth, rateLimit('messages'), (req, res) => {
 // Get messages since timestamp
 app.get('/api/messages', auth, rateLimit('messages-poll'), (req, res) => {
     const since = req.query.since || '1970-01-01T00:00:00.000Z';
-    const msgs = (messagesByUser.get(req.user.id) || [])
-        .filter(m => m.sentAt > since)
-        .slice(-500);
-    res.json(msgs);
+    const all = messagesByUser.get(req.user.id) || [];
+    if (unsortedUsers.has(req.user.id)) {
+        return res.json(all.filter(m => m.sentAt > since).slice(-500));
+    }
+    // Sorted by sentAt: binary-search the first message newer than `since`
+    // instead of testing every message this user has ever sent/received on
+    // each poll. Same result as filter(...).slice(-500).
+    let lo = 0, hi = all.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (all[mid].sentAt > since) hi = mid; else lo = mid + 1;
+    }
+    res.json(all.slice(Math.max(lo, all.length - 500)));
 });
 
 // Mark all messages in a thread addressed to me as read, and notify the sender.
