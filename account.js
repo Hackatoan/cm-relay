@@ -122,6 +122,13 @@ function registerAccountRoutes(app, deps) {
         const user = usersByFirebaseUid.get(req.fb.uid);
         if (!user) return res.status(404).json({ error: 'no_account' });
 
+        // The account doc and the key escrow are independent Firestore reads;
+        // start both now so login pays one round-trip instead of two.
+        const escrowP = readKeyEscrow(user.id);
+        // If we bail out below (account read failed), don't leave an unobserved
+        // rejection behind; `await escrowP` still sees any error as before.
+        escrowP.catch(() => {});
+
         let canvas = null;
         try {
             const snap = await fsdb.collection('accounts').doc(req.fb.uid).get();
@@ -135,7 +142,7 @@ function registerAccountRoutes(app, deps) {
         }
 
         let keypair, contacts;
-        const escrow = await readKeyEscrow(user.id);
+        const escrow = await escrowP;
         if (escrow?.publicKeyJwk && escrow?.privateKeyJwk) {
             try {
                 keypair = { publicKeyJwk: JSON.parse(escrow.publicKeyJwk), privateKeyJwk: JSON.parse(escrow.privateKeyJwk) };
