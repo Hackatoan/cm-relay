@@ -1,5 +1,6 @@
 'use strict';
 const express = require('express');
+const proxyaddr = require('proxy-addr');
 const { WebSocketServer } = require('ws');
 const crypto = require('crypto');
 const http = require('http');
@@ -196,7 +197,7 @@ const rateBuckets = new Map();
 function rateLimit(name) {
     const { windowMs, max } = RATE_LIMITS[name];
     return (req, res, next) => {
-        if (!withinLimit(rateBuckets, `${name}:${req.ip}`, windowMs, max)) {
+        if (!withinLimit(rateBuckets, `${name}:${clientIp(req)}`, windowMs, max)) {
             return res.status(429).json({ error: 'Too many requests — slow down' });
         }
         next();
@@ -216,6 +217,26 @@ setInterval(() => {
 }, 5 * 60_000).unref();
 
 const app = express();
+
+// Client IP for rate limiting. Behind a reverse proxy / CDN every request's
+// socket address is the proxy's, so all users share one bucket per limiter
+// (a single abusive client can exhaust e.g. the register or WS-connect
+// budget for everyone) and per-client limits don't apply. TRUST_PROXY opts
+// in to reading X-Forwarded-For from *trusted* hops only — it uses Express's
+// own trust-proxy syntax: a comma list of addresses/CIDRs/presets
+// ("loopback", "linklocal", "uniquelocal") or a hop count. Prefer an explicit
+// address list: a hop count or "true" lets anyone who can reach the port
+// directly spoof their IP. Unset = previous behavior (socket address).
+const TRUST_PROXY = (process.env.TRUST_PROXY || '').trim();
+if (TRUST_PROXY) {
+    app.set('trust proxy', /^\d+$/.test(TRUST_PROXY) ? Number(TRUST_PROXY)
+        : TRUST_PROXY === 'true' ? true : TRUST_PROXY.split(',').map(x => x.trim()).filter(Boolean));
+    console.log('[CM-Relay] trust proxy:', TRUST_PROXY);
+}
+const trustProxyFn = app.get('trust proxy fn');
+function clientIp(req) {
+    try { return proxyaddr(req, trustProxyFn) || 'unknown'; } catch { return req.socket?.remoteAddress || 'unknown'; }
+}
 app.disable('x-powered-by');
 app.use(express.json({ limit: '4mb' }));
 app.use((req, res, next) => {
@@ -603,7 +624,7 @@ const wss = new WebSocketServer({ server, path: '/ws', maxPayload: WS_MAX_PAYLOA
 const wsClients = new Map();
 
 wss.on('connection', (ws, req) => {
-    const ip = req.socket.remoteAddress || 'unknown';
+    const ip = clientIp(req);
     if (!withinLimit(wsConnectBuckets, ip, WS_CONNECT_LIMIT.windowMs, WS_CONNECT_LIMIT.max)) {
         ws.close(1013, 'Too many connections');
         return;
