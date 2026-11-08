@@ -8,7 +8,11 @@ const fs = require('fs');
 const dns = require('dns').promises;
 const net = require('net');
 const https = require('https');
-const admin = require('firebase-admin');
+// firebase-admin v14 removed the legacy namespaced API (admin.credential /
+// admin.firestore() / admin.auth()); use the modular entry points.
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getFirestore } = require('firebase-admin/firestore');
+const { getAuth } = require('firebase-admin/auth');
 const { registerAccountRoutes } = require('./account');
 
 const DB_PATH = process.env.RELAY_DB_PATH || '/data/relay.json';
@@ -63,8 +67,8 @@ let fsdb = null;
 try {
     const svcJson = process.env.FIREBASE_SERVICE_ACCOUNT;
     if (svcJson) {
-        admin.initializeApp({ credential: admin.credential.cert(JSON.parse(svcJson)) });
-        fsdb = admin.firestore();
+        initializeApp({ credential: cert(JSON.parse(svcJson)) });
+        fsdb = getFirestore();
     } else {
         console.warn('[CM-Relay] FIREBASE_SERVICE_ACCOUNT not set — cross-device key sync disabled.');
     }
@@ -538,7 +542,7 @@ registerAccountRoutes(app, {
     encKey: process.env.ACCOUNT_ENC_KEY,
     verifyIdToken: async token => {
         if (!fsdb) throw new Error('firebase not configured');
-        return admin.auth().verifyIdToken(token, true);
+        return getAuth().verifyIdToken(token, true);
     },
 });
 
