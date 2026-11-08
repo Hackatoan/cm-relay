@@ -368,14 +368,26 @@ app.post('/api/register', rateLimit('register'), async (req, res) => {
     if (!name) return res.status(400).json({ error: 'name and publicKey required' });
     if (email) email = String(email).trim().slice(0, MAX_EMAIL_LEN);
 
-    let existing = canvasUserId && canvasUrl
+    // A Canvas identity attached to a relay account is trusted elsewhere
+    // (cm-signaling routes calls by the canvasUserId /api/me reports, and a
+    // later reclaim adopts whatever keypair was escrowed for the account), so
+    // it must be proven before it is bound — for brand-new accounts too, not
+    // only when reclaiming an existing one. Verifying up front (before the
+    // lookup) also means the response doesn't reveal whether an account for
+    // this identity already exists. Accounts without a Canvas identity are
+    // unaffected.
+    const hasCanvasIdentity = !!(canvasUserId && canvasUrl);
+    if (hasCanvasIdentity && !(await verifyCanvasIdentity(canvasUrl, canvasUserId, canvasToken))) {
+        return res.status(401).json({ error: 'Could not verify Canvas identity for this account' });
+    }
+
+    // Looked up after the await so a concurrent registration for the same
+    // identity that finished first is reclaimed rather than duplicated.
+    let existing = hasCanvasIdentity
         ? usersByCanvasKey.get(canvasKey(canvasUrl, canvasUserId))
         : null;
 
     if (existing) {
-        if (!(await verifyCanvasIdentity(canvasUrl, canvasUserId, canvasToken))) {
-            return res.status(401).json({ error: 'Could not verify Canvas identity for this account' });
-        }
         // Rotate the token on every verified reclaim: anyone who obtained the
         // old one (e.g. via this same endpoint before this fix existed) must
         // not keep standing access just because the real owner re-registered.
@@ -408,11 +420,11 @@ app.post('/api/register', rateLimit('register'), async (req, res) => {
     const id = crypto.randomUUID();
     const authToken = crypto.randomBytes(32).toString('hex');
     const user = { id, name, email: email || null, publicKey, authToken,
-        canvasUserId: canvasUserId || null, canvasUrl: canvasUrl || null,
+        canvasUserId: hasCanvasIdentity ? canvasUserId : null, canvasUrl: hasCanvasIdentity ? canvasUrl : null,
         createdAt: new Date().toISOString() };
     db.users[id] = user;
     usersByToken.set(authToken, user);
-    if (canvasUserId && canvasUrl) usersByCanvasKey.set(canvasKey(canvasUrl, canvasUserId), user);
+    if (hasCanvasIdentity) usersByCanvasKey.set(canvasKey(canvasUrl, canvasUserId), user);
     saveDb();
     if (privateKey) await writeKeyEscrow(id, { publicKeyJwk: publicKey, privateKeyJwk: privateKey });
     res.json({ id, authToken });
