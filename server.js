@@ -281,18 +281,26 @@ function auth(req, res, next) {
 // actually holds a live Canvas session for that exact canvasUserId, by
 // presenting a Canvas API token the relay verifies server-side against
 // canvasUrl's own /api/v1/users/self.
-const PRIVATE_IPV4_RANGES = [
-    [/^127\./], [/^10\./], [/^169\.254\./], [/^192\.168\./],
-    [/^172\.(1[6-9]|2\d|3[01])\./], [/^0\./], [/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./],
-];
+// Everything that isn't ordinary public unicast is refused: the old
+// prefix-string checks missed whole classes of IPv6 spellings (unspecified
+// "::", IPv4-mapped forms of most private ranges, NAT64/6to4/Teredo, which
+// embed an arbitrary IPv4) plus reserved/multicast IPv4 ranges.
+const BLOCKED_ADDRS = new net.BlockList();
+for (const [net4, len] of [
+    ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+    ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.88.99.0', 24], ['192.168.0.0', 16],
+    ['198.18.0.0', 15], ['198.51.100.0', 24], ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4],
+]) BLOCKED_ADDRS.addSubnet(net4, len, 'ipv4');
+for (const [net6, len] of [
+    ['::', 128], ['::1', 128], ['::', 96] /* IPv4-compatible */, ['64:ff9b::', 96], ['64:ff9b:1::', 48],
+    ['100::', 64], ['2001::', 32] /* Teredo */, ['2001:db8::', 32], ['2002::', 16] /* 6to4 */,
+    ['fc00::', 7], ['fe80::', 10], ['fec0::', 10], ['ff00::', 8],
+]) BLOCKED_ADDRS.addSubnet(net6, len, 'ipv6');
+// (IPv4-mapped ::ffff:a.b.c.d is matched against the IPv4 rules by BlockList
+// itself, so it must not be blocked wholesale — that would block all IPv4.)
 function isPrivateIp(ip) {
-    if (net.isIPv4(ip)) return PRIVATE_IPV4_RANGES.some(([re]) => re.test(ip));
-    if (net.isIPv6(ip)) {
-        const lower = ip.toLowerCase();
-        return lower === '::1' || lower.startsWith('fe80:') || lower.startsWith('fc') || lower.startsWith('fd')
-            || lower.startsWith('::ffff:127.') || lower.startsWith('::ffff:10.') || lower.startsWith('::ffff:169.254.')
-            || lower.startsWith('::ffff:192.168.');
-    }
+    if (net.isIPv4(ip)) return BLOCKED_ADDRS.check(ip, 'ipv4');
+    if (net.isIPv6(ip)) return BLOCKED_ADDRS.check(ip, 'ipv6');
     return true; // unrecognized format: don't trust it
 }
 const CANVAS_VERIFY_TIMEOUT_MS = 5_000;
