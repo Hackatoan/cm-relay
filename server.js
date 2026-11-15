@@ -717,6 +717,29 @@ app.get('/api/invites/:token', rateLimit('invite-lookup'), (req, res) => {
     res.json({ id: u.id, name: u.name, email: u.email, publicKey: u.publicKey });
 });
 
+// Unauthenticated liveness probe for uptime monitors / container healthchecks.
+// Returns only static process info by default; HEALTH_STATS=1 opts in to
+// aggregate counts (no ids, names or content) for an ops dashboard.
+const STARTED_AT = new Date();
+const VERSION = (() => { try { return require('./package.json').version; } catch { return 'unknown'; } })();
+const HEALTH_STATS = /^(1|true|yes)$/i.test((process.env.HEALTH_STATS || '').trim());
+app.get('/health', (req, res) => {
+    const body = {
+        status: 'ok',
+        version: VERSION,
+        startedAt: STARTED_AT.toISOString(),
+        uptimeSec: Math.floor(process.uptime()),
+    };
+    if (HEALTH_STATS) {
+        body.stats = {
+            users: Object.keys(db.users).length,
+            messages: db.messages.length,
+            onlineSockets: wsClients.size,
+        };
+    }
+    res.json(body);
+});
+
 // Final error handler. Without it, Express's default handler answers errors
 // (e.g. a malformed JSON body from express.json()) with an HTML page that
 // includes the stack trace and server file paths unless NODE_ENV=production.

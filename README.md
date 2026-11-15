@@ -16,6 +16,7 @@ The REST API + message relay backend for [Canvas Messenger](https://github.com/H
 - Invite-link creation and lookup
 - Message relay between peers
 - Stateless, container-friendly
+- `GET /health` liveness probe (status, version, uptime); set `HEALTH_STATS=1` to also report aggregate user/message/socket counts
 
 ## Tech Stack
 
